@@ -11,6 +11,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Initialize file logging — all logs go to sci_verify.log
+from logging_config import setup_logging
+setup_logging()
+
+# ── Cost Safety: max input length for External Verifier ────────────────────
+MAX_INPUT_CHARS = 5_000  # ~1,250 tokens — keeps NLI auditing under budget
+
 st.set_page_config(
     page_title="Sci-Verify | Verified AI for Science",
     page_icon="🔬",
@@ -291,8 +298,8 @@ def render_results(result: dict):
 def main():
     render_header()
 
-    if not os.getenv("OPENAI_API_KEY"):
-        st.warning("⚠️ Please set `OPENAI_API_KEY` in your `.env` file to continue.")
+    if not os.getenv("GROQ_API_KEY"):
+        st.warning("⚠️ Please set `GROQ_API_KEY` in your `.env` file to continue.")
         st.stop()
 
     tab1, tab2 = st.tabs(["🔍 Deep Search", "🔎 Hallucination Check"])
@@ -354,6 +361,14 @@ def main():
             if not text:
                 st.error("Please upload a file or paste text.")
             else:
+                # Cost guard: truncate massive inputs
+                if len(text) > MAX_INPUT_CHARS:
+                    st.warning(
+                        f"⚠️ Input truncated from {len(text):,} to {MAX_INPUT_CHARS:,} "
+                        f"characters to keep API costs low."
+                    )
+                    text = text[:MAX_INPUT_CHARS]
+
                 from agent import run_external_verify
                 with st.spinner("🔬 Decomposing claims and auditing…"):
                     result = run_external_verify(text)
