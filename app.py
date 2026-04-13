@@ -249,6 +249,72 @@ def render_sources(sources):
         </div>""", unsafe_allow_html=True)
 
 
+def render_deep_search_results(result: dict):
+    """Render the purely text-based output for Deep Search."""
+    search_strategy = result.get("search_strategy", {})
+    sources = result.get("papers", [])
+    deep_results = result.get("deep_search_results", {})
+    
+    st.markdown("---")
+    
+    # 1. Search Strategy Expander
+    if search_strategy and (search_strategy.get("authors") or search_strategy.get("keywords")):
+        with st.expander("🔍 Intelligient Search Strategy", expanded=False):
+            st.markdown("**(LLM Query Reformulator)** Decoded the query to maximize OpenAlex hits.")
+            if search_strategy.get("authors"):
+                st.markdown(f"**Detected Authors:** `{'`, `'.join(search_strategy['authors'])}`")
+            if search_strategy.get("keywords"):
+                kw = " ➔ ".join(search_strategy["keywords"])
+                st.markdown(f"**Keywords (Specific to General):** `{kw}`")
+            if search_strategy.get("loops"):
+                st.markdown("**Search Paths Executed ⚡:**")
+                for loop in search_strategy["loops"]:
+                    st.code(loop, language="text")
+            if search_strategy.get("fallback_triggered"):
+                st.warning("Phase 1 yielded insufficient relevant papers. Triggered Phase 2: Keyword-only Fallback.")
+
+    st.markdown("")
+
+    col_left, col_right = st.columns([3, 2])
+    
+    with col_left:
+        st.markdown("### 🔬 Executive Summary")
+        intro = deep_results.get("introduction", "Error: No introduction returned.")
+        st.markdown(f'<div class="glass-card" style="font-size:1.1rem; line-height:1.6;">{intro}</div>', unsafe_allow_html=True)
+        
+        st.markdown("<br>### 📌 Exact Quotes", unsafe_allow_html=True)
+        quotes = deep_results.get("exact_citations", [])
+        if not quotes:
+            st.info("No exact quotes could be extracted from the retrieved text.")
+        else:
+            for q in quotes:
+                st.markdown(f"""
+                <div class="glass-card" style="border-left: 4px solid #7b2ff7; padding: 1rem; margin-bottom: 1rem;">
+                    <p style="font-style: italic; color: #e0e0e0; font-size: 1.05rem;">"{q.get('quote', '')}"</p>
+                    <p style="color: #8892b0; font-size: 0.85rem; text-align: right; margin: 0;">— <strong>{q.get('authors', 'Unknown')}</strong>, <em>{q.get('paper_title', 'Unknown')}</em></p>
+                </div>
+                """, unsafe_allow_html=True)
+
+    with col_right:
+        st.markdown("### 📚 Evaluated Papers")
+        for src in sources:
+            auths = ", ".join(src.get("authors", [])[:3])
+            if len(src.get("authors", [])) > 3: auths += " et al."
+            doi = src.get("doi", "")
+            
+            # Badge for full text logic
+            ft_badge = '<span style="color:#00ff88; font-size:0.75rem; border:1px solid #00ff88; padding:2px 6px; border-radius:10px; margin-bottom:10px; display:inline-block;">PDF Extracted</span>' if src.get("full_text") == "Retrieved" else '<span style="color:#ffc107; font-size:0.75rem; border:1px solid #ffc107; padding:2px 6px; border-radius:10px; margin-bottom:10px; display:inline-block;">Abstract Only</span>'
+
+            st.markdown(f"""
+            <div class="glass-card" style="padding:1rem;">
+                {ft_badge}<br>
+                <strong style="color:#00d2ff;">[P{src.get("source_id","?")}]</strong>
+                <span style="color:#e0e0e0;">{src.get("title","Untitled")}</span><br/>
+                <span style="color:#8892b0;font-size:0.85rem;">{auths} • {src.get("publication_date","N/A")}</span><br/>
+                <a href="{doi}" target="_blank" style="color:#7b2ff7;font-size:0.85rem;">{doi}</a>
+            </div>""", unsafe_allow_html=True)
+
+
 def parse_chatgpt_export(content: str) -> str:
     """Parse ChatGPT JSON export or plain text."""
     try:
@@ -329,7 +395,7 @@ def main():
         st.markdown(
             '<div class="glass-card">'
             "<h4 style='color:#e0e0e0;margin:0 0 .8rem 0;'>"
-            "Ask a Scientific Question</h4></div>",
+            "Deep Search Scientific Literature</h4></div>",
             unsafe_allow_html=True,
         )
         query = st.text_input(
@@ -338,17 +404,31 @@ def main():
             label_visibility="collapsed",
             key="deep_search_input",
         )
+        
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            is_oa_only = st.toggle("Prioritize Open Access (Forces Exact Quote Extraction)", value=False)
+        with col_f2:
+            max_papers = st.slider("Target Number of Papers", min_value=1, max_value=10, value=3)
+
         if st.button("🚀 Run Deep Search", key="btn_deep", use_container_width=True):
             if not query.strip():
                 st.error("Please enter a query.")
             else:
                 from agent import run_deep_search
-                with st.spinner("🔬 Searching OpenAlex, drafting, and auditing…"):
-                    result = run_deep_search(query.strip())
-                st.session_state["last_result"] = result
+                with st.status("🔬 Initializing Deep Search...", expanded=True) as status:
+                    def log_to_ui(msg: str):
+                        # Truncate for UI if too long
+                        if len(msg) > 80: msg = msg[:77] + "..."
+                        status.update(label=f"🔬 {msg}")
+                        st.write(msg)
+                    
+                    result = run_deep_search(query.strip(), max_papers=max_papers, is_oa_only=is_oa_only, ui_callback=log_to_ui)
+                    status.update(label="✅ Deep Search Complete!", state="complete", expanded=False)
+                st.session_state["deep_result"] = result
 
-        if "last_result" in st.session_state:
-            render_results(st.session_state["last_result"])
+        if "deep_result" in st.session_state:
+            render_deep_search_results(st.session_state["deep_result"])
 
     # ── Tab 2: External Verifier ──
     with tab2:

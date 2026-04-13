@@ -42,6 +42,7 @@ class PaperSource(BaseModel):
         default_factory=lambda: datetime.now(timezone.utc).isoformat(),
         description="ISO timestamp – provenance chain",
     )
+    relevance_score: Optional[int] = Field(default=None, description="LLM relevance score out of 100")
 
 
 class NLIResult(BaseModel):
