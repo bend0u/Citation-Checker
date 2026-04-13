@@ -14,7 +14,7 @@ from typing import Optional
 from sentence_transformers import SentenceTransformer
 import faiss
 import pyalex
-from pyalex import Works
+from pyalex import Works, Authors
 
 from models import PaperSource
 
@@ -51,16 +51,29 @@ def reconstruct_abstract(inverted_index: dict) -> str:
     return " ".join(w for _, w in word_positions)
 
 
-def search_openalex(query: str, max_results: int = 5) -> list[PaperSource]:
-    """Search OpenAlex for papers, sorted by citation count."""
-    logger.info(f"[RETRIEVAL] Searching OpenAlex: query='{query[:80]}...', max_results={max_results}")
+def search_openalex(query: str, author_name: str = None, max_results: int = 5) -> list[PaperSource]:
+    """Search OpenAlex for papers matching the given query, optionally filtering by author name."""
+    logger.info(f"[RETRIEVAL] Searching OpenAlex: query='{query[:50]}...', author='{author_name}', max_results={max_results}")
+    
+    author_filter = {}
+    if author_name:
+        try:
+            # Query the best matched author to get their OpenAlex ID
+            authors = Authors().search(author_name).get(per_page=1)
+            if authors:
+                author_id = authors[0]['id'].split("/")[-1]
+                author_filter = {"author": {"id": author_id}}
+                logger.debug(f"[RETRIEVAL] Resolved author '{author_name}' to OpenAlex ID '{author_id}'")
+            else:
+                logger.warning(f"[RETRIEVAL] Could not resolve author '{author_name}', falling back to keyword search.")
+        except Exception as e:
+            logger.warning(f"[RETRIEVAL] Author resolution failed ({e}), continuing without author filter.")
+
     try:
-        results = (
-            Works()
-            .search(query)
-            .sort(cited_by_count="desc")
-            .get(per_page=max_results)
-        )
+        w = Works().search(query)
+        if author_filter:
+            w = w.filter(**author_filter)
+        results = w.get(per_page=max_results)
     except Exception as e:
         logger.error(f"[RETRIEVAL] OpenAlex search FAILED: {e}")
         return []

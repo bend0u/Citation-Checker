@@ -280,6 +280,26 @@ def render_results(result: dict):
     render_metrics(metrics)
     st.markdown("")
 
+    strategy = result.get("search_strategy", {})
+    if strategy and (strategy.get("authors") or strategy.get("keywords")):
+        with st.expander("🔍 Intelligient Search Strategy", expanded=False):
+            st.markdown("**(LLM Query Reformulator)** Decoded the query to maximize OpenAlex hits.")
+            if strategy.get("authors"):
+                st.markdown(f"**Detected Authors:** `{'`, `'.join(strategy['authors'])}`")
+            if strategy.get("keywords"):
+                kw = " ➔ ".join(strategy["keywords"])
+                st.markdown(f"**Keywords (Specific to General):** `{kw}`")
+            
+            if strategy.get("loops"):
+                st.markdown("**Search Paths Executed ⚡:**")
+                for loop in strategy["loops"]:
+                    st.code(loop, language="text")
+            
+            if strategy.get("fallback_triggered"):
+                st.warning("Phase 1 yielded insufficient relevant papers. Triggered Phase 2: Keyword-only Fallback.")
+
+    st.markdown("")
+
     col_left, col_right = st.columns([3, 2])
     sources_dict = {s.get("source_id", i): s for i, s in enumerate(sources)}
 

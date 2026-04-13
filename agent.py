@@ -60,6 +60,7 @@ class SciVerifyState(TypedDict):
     metrics: dict
     confidence: float
     status: str
+    search_strategy: dict           # Logs {authors: [], keywords: [], loops: []}
 
 
 # ── LLM factory ────────────────────────────────────────────────────────────
@@ -73,22 +74,27 @@ def get_llm(model: str = MODEL_NLI, temperature: float = 0.0) -> ChatGroq:
 
 # ── Query Reformulator ─────────────────────────────────────────────────
 REFORMULATE_SYSTEM = (
-    "You are a scientific search query optimizer. "
-    "Given a user's research question, generate 2-3 short, targeted academic "
-    "search queries optimized for a scientific paper database.\n"
+    "You are an academic search query extractor.\n"
+    "Given a user's research question, extract the relevant author names (if any) "
+    "and a list of precise, minimalist academic search queries/keywords.\n\n"
     "Rules:\n"
-    "1. Each query should be 3-6 words, using precise academic terminology.\n"
-    "2. Include author names if mentioned.\n"
-    "3. Cover different angles of the question (core topic, specific method, key authors).\n"
-    "4. Do NOT use question words (what, how, why). Use noun phrases only.\n"
-    'Respond ONLY with JSON: {"queries": ["query1", "query2", "query3"]}'
+    "1. Authors should be a disjoint list of last names/full names if mentioned. If none, empty list.\n"
+    "2. Keywords must go from MOST specific (covering the core concept and details) to LEAST specific (broader topic).\n"
+    "3. Keywords should be noun phrases only. Do NOT use question words (what, how).\n"
+    "4. Do NOT include author names inside the keywords list.\n"
+    "5 Be as minimal as possible. Do not use too much words\n"
+    'Respond ONLY with JSON:\n'
+    '{"authors": ["Author1", "Author2"], "keywords": ["specific keyword combo", "broader keyword", "broadest keyword"]}'
+    "Here is an example of query and some keywords generated "
+    "What are the three main properties of the Raft consensus algorithm as defined by Ongaro and Ousterhout"
+    '{"authors": ["Ongaro", "Ousterhout"],"keywords":["Raft consensus algorithm", "Raft algorithm", "consensus algorithm"]}'
 )
 
 
-def reformulate_query(user_query: str) -> list[str]:
-    """Convert a natural language question into optimized academic search queries."""
-    logger.info(f"[REFORMULATOR] Reformulating query: '{user_query[:80]}...'")
-    llm = get_llm(MODEL_NLI, temperature=0.0)  # cheapest model
+def reformulate_query(user_query: str) -> dict:
+    """Extract authors and specific->general keywords."""
+    logger.info(f"[REFORMULATOR] Decoding query: '{user_query[:80]}...'")
+    llm = get_llm(MODEL_NLI, temperature=0.0)  # fast, cheap model
     try:
         resp = llm.invoke([
             SystemMessage(content=REFORMULATE_SYSTEM),
@@ -101,41 +107,115 @@ def reformulate_query(user_query: str) -> list[str]:
                 text = text[4:]
             text = text.strip()
         parsed = json.loads(text)
-        queries = parsed.get("queries", [user_query])
-        logger.info(f"[REFORMULATOR] Generated {len(queries)} search queries: {queries}")
-        return queries if queries else [user_query]
+        
+        authors = parsed.get("authors", [])
+        keywords = parsed.get("keywords", [user_query])
+        # Ensure at least one keyword
+        if not keywords: keywords = [user_query]
+            
+        logger.info(f"[REFORMULATOR] Authors: {authors}")
+        logger.info(f"[REFORMULATOR] Keywords: {keywords}")
+        return {"authors": authors, "keywords": keywords}
     except Exception as e:
         logger.warning(f"[REFORMULATOR] Failed ({e}), falling back to original query.")
-        return [user_query]
+        return {"authors": [], "keywords": [user_query]}
+
+
+# ── Relevance Checker ─────────────────────────────────────────────────────
+def evaluate_paper_relevance(user_query: str, paper_title: str, paper_abstract: str) -> bool:
+    """Uses LLM to evaluate if a retrieved paper is relevant to the search."""
+    # Fast filtering with 8b model
+    llm = get_llm(MODEL_NLI, temperature=0.0)
+    sys = (
+        "You are a strict academic relevance filter. Does the following paper CLEARLY relate "
+        "to the user's research query? "
+        "If it is relevant or plausibly helpful, answer YES. If it is completely off-topic, answer NO.\n"
+        "Output ONLY the word YES or NO."
+    )
+    prompt = f"Query: {user_query}\n\nPaper Title: {paper_title}\nPaper Abstract: {paper_abstract[:1500]}"
+    try:
+        resp = llm.invoke([SystemMessage(content=sys), HumanMessage(content=prompt)])
+        return "YES" in resp.content.upper()
+    except Exception as e:
+        logger.error(f"[RELEVANCE] LLM failure: {e}")
+        return True  # default to keeping it if the LLM crashes
 
 
 # ── Node 1: Generator ─────────────────────────────────────────────────────
 def generate_draft(state: SciVerifyState) -> dict:
-    """Search OpenAlex and draft a cited response (or say 'I don't know')."""
+    """Intelligent nested search, relevance filtering, and draft generation."""
     query = state["query"]
-    logger.info(f"[GENERATOR] Starting draft generation for query: '{query[:80]}...'")
+    logger.info(f"[GENERATOR] Starting workflow for: '{query[:80]}...'")
 
-    # Step 1: Reformulate the user query into targeted academic searches
-    search_queries = reformulate_query(query)
+    search_strategy = {
+        "authors": [],
+        "keywords": [],
+        "loops": [],
+        "fallback_triggered": False
+    }
 
-    # Step 2: Search OpenAlex with each reformulated query, deduplicate by DOI
+    # Step 1: Decode the query
+    strategy = reformulate_query(query)
+    authors = strategy["authors"]
+    keywords = strategy["keywords"]
+    
+    search_strategy["authors"] = authors
+    search_strategy["keywords"] = keywords
+
     seen_dois: set[str] = set()
-    all_papers = []
-    for sq in search_queries:
-        results = search_openalex(sq, max_results=3)
-        for p in results:
-            key = p.doi or p.title  # fallback to title if no DOI
-            if key not in seen_dois:
-                seen_dois.add(key)
+    all_papers: list[PaperSource] = []
+    
+    def process_and_add(search_results, loop_name):
+        """Helper to check cache and evaluate relevance."""
+        added = 0
+        for p in search_results:
+            key = p.doi or p.title
+            if not key or key in seen_dois:
+                continue
+            seen_dois.add(key)
+            
+            # Evaluate relevance
+            is_relevant = evaluate_paper_relevance(query, p.title, p.abstract or "")
+            if is_relevant:
                 p.source_id = len(all_papers)
                 all_papers.append(p)
+                added += 1
+                logger.info(f"[SEARCH] ✅ Relevant: {p.title[:60]}")
+            else:
+                logger.debug(f"[SEARCH] ❌ Irrelevant: {p.title[:60]}")
+            
+            if len(all_papers) >= 5:
+                break
+        if added > 0:
+            search_strategy["loops"].append(f"{loop_name} -> found {added} papers")
 
-    # Limit to top 5 papers
-    papers = all_papers[:5]
-    papers_dicts = [p.model_dump() for p in papers]
-    logger.info(f"[GENERATOR] Retrieved {len(papers)} unique papers from {len(search_queries)} queries.")
+    # Step 2: Phase 1 (Author + Keyword Disjoint Combinations)
+    if authors:
+        logger.info(f"[GENERATOR] Phase 1: Author + Keyword combinations")
+        # only use top 3 keywords max for Phase 1 to avoid excessive searches
+        for k in keywords[:3]:
+            for a in authors:
+                if len(all_papers) >= 5: break
+                loop_name = f"Search(Keyword: '{k}' + Author API: '{a}')"
+                logger.info(f"[SEARCH] {loop_name}")
+                results = search_openalex(query=k, author_name=a, max_results=3)
+                process_and_add(results, loop_name)
+    
+    # Step 3: Phase 2 (Fallback: Keywords only, specific to general)
+    if len(all_papers) < 5:
+        search_strategy["fallback_triggered"] = True
+        logger.info(f"[GENERATOR] Phase 2: Keyword-only fallback search")
+        for k in keywords:
+            if len(all_papers) >= 5: break
+            loop_name = f"Search(Keyword: '{k}')"
+            logger.info(f"[SEARCH] {loop_name}")
+            results = search_openalex(k, max_results=3)
+            process_and_add(results, loop_name)
 
-    if not papers:
+    logger.info(f"[GENERATOR] Compiled {len(all_papers)} unique, relevant papers.")
+    papers_dicts = [p.model_dump() for p in all_papers]
+
+    if not all_papers:
         logger.warning("[GENERATOR] No papers found — returning insufficient evidence.")
         return {
             "papers": [],
@@ -144,9 +224,9 @@ def generate_draft(state: SciVerifyState) -> dict:
             "status": "no_papers_found",
         }
 
-    logger.info(f"[GENERATOR] Building context from {len(papers)} paper abstracts...")
+    logger.info(f"[GENERATOR] Building context from {len(all_papers)} paper abstracts...")
     ctx_parts = []
-    for p in papers:
+    for p in all_papers:
         auths = ", ".join(p.authors[:3])
         if len(p.authors) > 3:
             auths += " et al."
@@ -201,6 +281,7 @@ def generate_draft(state: SciVerifyState) -> dict:
         "draft": draft,
         "confidence": confidence,
         "status": "draft_generated",
+        "search_strategy": search_strategy,
     }
 
 
@@ -265,17 +346,22 @@ def retrieve_evidence(state: SciVerifyState) -> dict:
     if not papers_dicts:
         logger.info("[RETRIEVE] No papers in state — reformulating claims for OpenAlex search...")
         combined = " ".join(c["text"] for c in claims[:3])
-        search_queries = reformulate_query(combined)
+        strategy = reformulate_query(combined)
+        keywords = strategy["keywords"]
         seen_dois: set[str] = set()
         all_papers = []
-        for sq in search_queries:
+        for sq in keywords:
             results = search_openalex(sq, max_results=3)
             for p in results:
                 key = p.doi or p.title
-                if key not in seen_dois:
-                    seen_dois.add(key)
+                if not key or key in seen_dois:
+                    continue
+                seen_dois.add(key)
+                if evaluate_paper_relevance(combined, p.title, p.abstract or ""):
                     p.source_id = len(all_papers)
                     all_papers.append(p)
+            if len(all_papers) >= 5:
+                break
         papers = all_papers[:5]
         papers_dicts = [p.model_dump() for p in papers]
     else:
@@ -489,7 +575,7 @@ def run_deep_search(query: str) -> dict:
         "query": query, "mode": "deep_search", "input_text": None,
         "papers": [], "draft": "", "claims": [], "evidence": {},
         "support_matrix": [], "metrics": {}, "confidence": 0.0,
-        "status": "starting",
+        "status": "starting", "search_strategy": {},
     })
     logger.info(f"{'='*40} DEEP SEARCH END {'='*40}")
     return result
@@ -503,7 +589,7 @@ def run_external_verify(text: str) -> dict:
         "query": "", "mode": "external_verify", "input_text": text,
         "papers": [], "draft": text, "claims": [], "evidence": {},
         "support_matrix": [], "metrics": {}, "confidence": 1.0,
-        "status": "starting",
+        "status": "starting", "search_strategy": {},
     })
     logger.info(f"{'='*40} EXTERNAL VERIFY END {'='*40}")
     return result
