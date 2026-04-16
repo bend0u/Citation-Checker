@@ -30,6 +30,8 @@ pip install -r requirements.txt
 ```
 
 ### 4. Configure environment variables
+This can be done by commands, or by adding a new .env file in the corresponding format
+
 ```bash
 cp .env.example .env
 ```
