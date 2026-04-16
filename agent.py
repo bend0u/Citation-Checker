@@ -18,7 +18,7 @@ from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from models import (
-    AtomicClaim, NLILabel, NLIResult, SupportMatrixEntry,
+    ExtractedCitation, CitationTarget, VerificationStatus, VerificationResult
 )
 from retrieval import (
     search_openalex, build_snippet_index, retrieve_relevant_snippets,
@@ -54,9 +54,8 @@ class SciVerifyState(TypedDict):
     input_text: Optional[str]
     papers: list                    # list[dict]  (PaperSource dicts)
     draft: str
-    claims: list                    # list[dict]  (AtomicClaim dicts)
-    evidence: dict                  # str(claim_id) -> [{snippet, source_id, score}]
-    support_matrix: list            # list[dict]  (SupportMatrixEntry dicts)
+    citations: list                   # list[dict]  (ExtractedCitation dicts)
+    verification_results: list        # list[dict]  (VerificationResult dicts)
     metrics: dict
     confidence: float
     status: str
@@ -387,238 +386,203 @@ def execute_deep_search(state: SciVerifyState) -> dict:
 
 # ── Node 2: Decomposer ────────────────────────────────────────────────────
 def decompose_claims(state: SciVerifyState) -> dict:
-    """Break the draft into atomic, verifiable claims (JSON mode)."""
+    """Extract explicit quotes and semantic citations into structured targets."""
     draft = state.get("input_text") or state.get("draft", "")
     if not draft:
         logger.warning("[DECOMPOSER] No draft text to decompose.")
-        return {"claims": [], "status": "no_draft"}
+        return {"citations": [], "status": "no_draft"}
 
-    logger.info(f"[DECOMPOSER] Decomposing draft ({len(draft)} chars) using {MODEL_DECOMPOSER}...")
+    logger.info(f"[DECOMPOSER] Parsing citations from text ({len(draft)} chars) using {MODEL_DECOMPOSER}...")
     llm = get_llm(MODEL_DECOMPOSER, temperature=0.0)
     sys = (
-        "Break the following text into atomic scientific claims.\n"
-        "Each claim = one standalone verifiable sentence.\n"
-        "Split sentences with two ideas into two claims.\n"
-        "Remove meta-statements. Keep all technical detail.\n"
-        'Respond ONLY with JSON: {"claims": ["...", "..."]}'
+        "You are an expert scientific hallucination auditor.\n"
+        "Your task is to extract every single claim or quote that refers to an external paper.\n"
+        "If they use quotation marks, mark 'is_explicit_quote' as true.\n"
+        "If there are ZERO external papers cited or mentioned, return an empty list [].\n\n"
+        "Respond ONLY with valid JSON exactly matching the following schema:\n"
+        "{\n"
+        '  "citations": [\n'
+        '    {\n'
+        '      "text": "<The exact sentence or literal quote from the text>",\n'
+        '      "is_explicit_quote": <boolean>,\n'
+        '      "target_metadata": {\n'
+        '          "title": "<The inferred or explicit paper title. If none, null>",\n'
+        '          "authors": ["<Extracted author 1>", ...],\n'
+        '          "year": <Integer. If none, null>,\n'
+        '          "core_topic": "<Max 3 words capturing the specific mechanism>"\n'
+        '      }\n'
+        '    }\n'
+        '  ]\n'
+        "}"
     )
     resp = llm.invoke([SystemMessage(content=sys), HumanMessage(content=draft)])
 
     try:
         text = resp.content.strip()
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.strip()
-        parsed = json.loads(text)
-        claim_texts = parsed.get("claims", [])
-        logger.info(f"[DECOMPOSER] Successfully parsed {len(claim_texts)} atomic claims.")
-    except (json.JSONDecodeError, KeyError) as e:
-        logger.warning(f"[DECOMPOSER] JSON parse failed ({e}), falling back to sentence splitting.")
         import re
-        claim_texts = [
-            s.strip() for s in re.split(r"(?<=[.!?])\s+", draft)
-            if len(s.strip()) > 20
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match: text = match.group(0)
+        parsed = json.loads(text)
+        raw_citations = parsed.get("citations", [])
+        
+        # Cast to strictly validated models
+        valid_citations = [
+            ExtractedCitation(claim_id=i, **c).model_dump() 
+            for i, c in enumerate(raw_citations)
         ]
-        logger.info(f"[DECOMPOSER] Fallback produced {len(claim_texts)} claims.")
+        logger.info(f"[DECOMPOSER] Successfully extracted {len(valid_citations)} citation blocks.")
+    except Exception as e:
+        logger.error(f"[DECOMPOSER] JSON parse/validation failed: {e}")
+        valid_citations = []
 
-    claims = [
-        AtomicClaim(claim_id=i, text=t).model_dump()
-        for i, t in enumerate(claim_texts)
-    ]
-    for c in claims:
-        logger.info(f"[DECOMPOSER]   Claim {c['claim_id']}: '{c['text'][:80]}...'")
-    return {"claims": claims, "status": "claims_decomposed"}
+    for c in valid_citations:
+        logger.info(f"[DECOMPOSER] Extracted (Quote: {c['is_explicit_quote']}): {c['text'][:60]}... -> {c['target_metadata']}")
+
+    return {"citations": valid_citations, "status": "citations_decomposed"}
 
 
-# ── Node 3: Retrieve & Rerank ─────────────────────────────────────────────
-def retrieve_evidence(state: SciVerifyState) -> dict:
-    """Retrieve and rerank relevant snippets for each claim."""
-    claims = state.get("claims", [])
-    papers_dicts = state.get("papers", [])
-    logger.info(f"[RETRIEVE] Starting evidence retrieval for {len(claims)} claims...")
-
-    if not claims:
-        logger.warning("[RETRIEVE] No claims to retrieve evidence for.")
-        return {"evidence": {}, "status": "no_claims"}
-
-    if not papers_dicts:
-        logger.info("[RETRIEVE] No papers in state — reformulating claims for OpenAlex search...")
-        combined = " ".join(c["text"] for c in claims[:3])
-        strategy = reformulate_query(combined)
-        keywords = strategy["keywords"]
-        seen_dois: set[str] = set()
-        all_papers = []
-        for sq in keywords:
-            results = search_openalex(sq, max_results=3)
-            for p in results:
-                key = p.doi or p.title
-                if not key or key in seen_dois:
-                    continue
-                seen_dois.add(key)
-                if evaluate_paper_relevance(combined, p.title, p.abstract or ""):
-                    p.source_id = len(all_papers)
-                    all_papers.append(p)
-            if len(all_papers) >= 5:
-                break
-        papers = all_papers[:5]
-        papers_dicts = [p.model_dump() for p in papers]
-    else:
-        papers = [PaperSource(**p) for p in papers_dicts]
-
-    if not papers:
-        logger.warning("[RETRIEVE] No sources found for evidence retrieval.")
-        return {"papers": papers_dicts, "evidence": {}, "status": "no_sources"}
-
-    index, snippets, sids = build_snippet_index(papers)
-
-    evidence: dict = {}
-    for claim in claims:
-        cid = claim["claim_id"]
-        results = retrieve_relevant_snippets(
-            claim["text"], index, snippets, sids, top_k=3,
+# ── Node 3: OpenAlex Verification (Phase 2) ──────────────────────────────────
+def search_literature(state: SciVerifyState) -> dict:
+    """Verify citations exist via abstract metadata and cascading OpenAlex search."""
+    from retrieval import verify_openalex_citation
+    citations = state.get("citations", [])
+    logger.info(f"[SEARCH] Verifying {len(citations)} extracted citations against OpenAlex...")
+    
+    results = []
+    
+    for c_dict in citations:
+        ext_cit = ExtractedCitation(**c_dict)
+        logger.info(f"[SEARCH] Validating target for claim {ext_cit.claim_id}: {ext_cit.target_metadata.title or ext_cit.target_metadata.core_topic}")
+        matched_paper, reasoning = verify_openalex_citation(ext_cit.target_metadata)
+        
+        status = VerificationStatus.HALLUCINATED_PAPER
+        if matched_paper:
+            if matched_paper.oa_pdf_url:
+                status = VerificationStatus.VERIFIED_QUOTE # Temporary status, to be updated in Phase 3
+            else:
+                status = VerificationStatus.UNKNOWN_PAYWALLED
+                
+        res = VerificationResult(
+            claim_id=ext_cit.claim_id,
+            status=status,
+            matched_paper=matched_paper,
+            reasoning=reasoning
         )
-        evidence[str(cid)] = [
-            {"snippet": r[0], "source_id": r[1], "score": r[2]} for r in results
-        ]
-
-    total_pairs = sum(len(v) for v in evidence.values())
-    logger.info(f"[RETRIEVE] Evidence retrieved: {total_pairs} claim-source pairs across {len(claims)} claims.")
-    return {"papers": papers_dicts, "evidence": evidence, "status": "evidence_retrieved"}
+        results.append(res.model_dump())
+        
+    return {"verification_results": results, "status": "search_complete"}
 
 
-# ── Node 4: NLI Auditor (rate-limit-aware) ─────────────────────────────────
-NLI_SYSTEM = (
-    "You are an NLI judge for scientific claims.\n"
-    "Given a CLAIM and SOURCE TEXT, classify support.\n"
+# ── Node 4: Dual-Engine Verification (Phase 3) ─────────────────────────────
+NLI_SUPPORT_SYSTEM = (
+    "You are a semantic evaluator. Does the SOURCE TEXT support the CLAIM?\n"
     "Respond ONLY with JSON:\n"
-    '{"label":"Entailment"|"Neutral"|"Contradiction",'
-    '"confidence":<0-1>,'
-    '"source_quote":"<exact relevant quote from source>",'
-    '"reasoning":"<one sentence>"}'
+    '{"supported": true|false, "reasoning": "<1 sentence>"}'
 )
 
-
-def audit_claims(state: SciVerifyState) -> dict:
-    """Run NLI on each claim-evidence pair with Groq rate-limit throttling."""
-    claims = state.get("claims", [])
-    evidence = state.get("evidence", {})
-    if not claims or not evidence:
-        logger.warning("[AUDITOR] Nothing to audit — claims or evidence empty.")
-        return {"support_matrix": [], "status": "nothing_to_audit"}
-
+def verify_quotes(state: SciVerifyState) -> dict:
+    """Run fuzzy string matching or NLI semantic validation."""
+    citations_data = state.get("citations", [])
+    results_data = state.get("verification_results", [])
+    
+    citations = {c['claim_id']: ExtractedCitation(**c) for c in citations_data}
+    results = {r['claim_id']: VerificationResult(**r) for r in results_data}
+    
     llm = get_llm(MODEL_NLI, temperature=0.0)
+    import re
+    from thefuzz import fuzz
+    from retrieval import build_snippet_index, retrieve_relevant_snippets
 
-    tasks_list = []
-    for claim in claims:
-        cid = claim["claim_id"]
-        for ev in evidence.get(str(cid), []):
-            tasks_list.append((claim["text"], ev["snippet"], cid, ev["source_id"]))
-
-    logger.info(f"[AUDITOR] Starting NLI audit: {len(tasks_list)} evaluations using {MODEL_NLI}")
-    logger.info(f"[AUDITOR] Estimated time: ~{len(tasks_list) * NLI_DELAY_BETWEEN_CALLS:.0f}s (rate-limited at {NLI_DELAY_BETWEEN_CALLS}s/call)")
-
-    def eval_one_sync(claim_text, snippet, cid, sid):
-        try:
-            resp = llm.invoke([
-                SystemMessage(content=NLI_SYSTEM),
-                HumanMessage(
-                    content=f"CLAIM: {claim_text}\n\n"
-                            f"SOURCE TEXT: {snippet[:800]}"
-                ),
-            ])
-            txt = resp.content.strip()
-            if txt.startswith("```"):
-                txt = txt.split("```")[1]
-                if txt.startswith("json"):
-                    txt = txt[4:]
-                txt = txt.strip()
-            p = json.loads(txt)
-            result = NLIResult(
-                label=NLILabel(p.get("label", "Neutral")),
-                confidence=max(0.0, min(1.0, float(p.get("confidence", 0.5)))),
-                source_quote=p.get("source_quote", ""),
-                reasoning=p.get("reasoning", ""),
-            )
-        except Exception as e:
-            logger.error(f"[AUDITOR] NLI error claim {cid} src {sid}: {e}")
-            result = NLIResult(
-                label=NLILabel.NEUTRAL, confidence=0.0,
-                source_quote="", reasoning=f"Error: {e}",
-            )
-        return SupportMatrixEntry(
-            claim_id=cid, source_id=sid, result=result,
-        ).model_dump()
-
-    matrix_entries = []
-    for i, (claim_text, snippet, cid, sid) in enumerate(tasks_list):
-        logger.info(f"[AUDITOR]   [{i+1}/{len(tasks_list)}] Evaluating claim {cid} vs source {sid}...")
-        entry = eval_one_sync(claim_text, snippet, cid, sid)
-        label = entry['result']['label']
-        conf = entry['result']['confidence']
-        logger.info(f"[AUDITOR]   [{i+1}/{len(tasks_list)}] Result: {label} (conf={conf:.2f})")
-        matrix_entries.append(entry)
-
-        if i < len(tasks_list) - 1:
-            time.sleep(NLI_DELAY_BETWEEN_CALLS)
-
-    logger.info(f"[AUDITOR] Audit complete: {len(matrix_entries)} evaluations finished.")
-    return {"support_matrix": matrix_entries, "status": "audit_complete"}
-
-
-# ── Node 5: Metrics Calculator ─────────────────────────────────────────────
-def calculate_metrics(state: SciVerifyState) -> dict:
-    """Compute Citation Accuracy and Citation Thoroughness."""
-    claims = state.get("claims", [])
-    matrix = state.get("support_matrix", [])
-    logger.info(f"[METRICS] Calculating metrics from {len(matrix)} evaluations across {len(claims)} claims...")
-
-    if not matrix:
-        logger.warning("[METRICS] No matrix entries — returning zero metrics.")
-        return {
-            "metrics": {
-                "citation_accuracy": 0.0, "citation_thoroughness": 0.0,
-                "total_claims": len(claims), "verified_claims": 0,
-                "total_evaluations": 0, "entailments": 0,
-                "neutrals": 0, "contradictions": 0,
-            },
-            "status": "metrics_calculated",
-        }
-
-    ent = neu = con = 0
-    claim_ok: dict[int, bool] = {}
-    for entry in matrix:
-        lab = entry["result"]["label"]
-        cid = entry["claim_id"]
-        if lab == "Entailment":
-            ent += 1; claim_ok[cid] = True
-        elif lab == "Neutral":
-            neu += 1
+    for cid, res in results.items():
+        if res.status in (VerificationStatus.HALLUCINATED_PAPER, VerificationStatus.UNKNOWN_PAYWALLED):
+            logger.info(f"[VERIFY] Claim {cid} skipped (Paper missing or paywalled)")
+            continue
+            
+        cit = citations[cid]
+        paper = res.matched_paper
+        
+        # Build index for just this paper (with full text extraction attempt)
+        index, snippets, sids = build_snippet_index([paper], attempt_full_text=True)
+        if index.ntotal == 0:
+            res.status = VerificationStatus.UNKNOWN_PAYWALLED
+            res.reasoning = "Document text could not be extracted."
+            continue
+            
+        # Retrieve top 5 most relevant overlapping chunks
+        top_chunks = retrieve_relevant_snippets(cit.text, index, snippets, sids, top_k=5)
+        
+        if cit.is_explicit_quote:
+            # Mathematical Fuzz Match
+            best_score = 0
+            for chunk_str, _, _ in top_chunks:
+                score = fuzz.token_set_ratio(cit.text.lower(), chunk_str.lower())
+                if score > best_score:
+                    best_score = score
+            
+            res.similarity_score = float(best_score)
+            if best_score >= 85:
+                res.status = VerificationStatus.VERIFIED_QUOTE
+                res.reasoning = f"Fuzzy sequence match succeeded (Score: {best_score}%)"
+            else:
+                res.status = VerificationStatus.HALLUCINATED_QUOTE
+                res.reasoning = f"Fuzzy sequence match failed (Highest similarity: {best_score}%)"
+                
         else:
-            con += 1
+            # Semantic NLI Match
+            best_support = False
+            reasons = []
+            for chunk_str, _, _ in top_chunks:
+                try:
+                    resp = llm.invoke([
+                        SystemMessage(content=NLI_SUPPORT_SYSTEM),
+                        HumanMessage(content=f"CLAIM: {cit.text}\n\nSOURCE TEXT: {chunk_str[:1200]}")
+                    ])
+                    # Parse JSON safely
+                    txt = resp.content.strip()
+                    match = re.search(r'\{.*\}', txt, re.DOTALL)
+                    if match: txt = match.group(0)
+                    p = json.loads(txt)
+                    
+                    if p.get("supported", False):
+                        best_support = True
+                        res.reasoning = p.get("reasoning", "Supported by context.")
+                        break
+                    else:
+                        reasons.append(p.get("reasoning", "Not supported."))
+                except Exception as e:
+                    logger.error(f"[VERIFY] NLI JSON loop error: {e}")
+            
+            if best_support:
+                res.status = VerificationStatus.SUPPORTED_SUMMARY
+            else:
+                res.status = VerificationStatus.UNSUPPORTED_SUMMARY
+                res.reasoning = reasons[0] if reasons else "No semantic support found in context."
 
-    total = len(claims)
-    verified = len(claim_ok)
-    accuracy = verified / total if total else 0.0
-    thoroughness = ent / len(matrix) if matrix else 0.0
+    final_results = [results[cid].model_dump() for cid in sorted(results.keys())]
+    return {"verification_results": final_results, "status": "verification_complete"}
 
-    logger.info(
-        f"[METRICS] Results: Accuracy={accuracy:.2%}, Thoroughness={thoroughness:.2%} | "
-        f"Entailments={ent}, Neutrals={neu}, Contradictions={con} | "
-        f"Verified={verified}/{total} claims"
-    )
 
+# ── Node 5: Report Compilation ─────────────────────────────────────────────
+def compile_report(state: SciVerifyState) -> dict:
+    """Calculate aggregate success metrics."""
+    results = state.get("verification_results", [])
+    
+    total = len(results)
+    verified = sum(1 for r in results if r['status'] in (VerificationStatus.VERIFIED_QUOTE, VerificationStatus.SUPPORTED_SUMMARY))
+    hallucinated = sum(1 for r in results if r['status'] in (VerificationStatus.HALLUCINATED_QUOTE, VerificationStatus.HALLUCINATED_PAPER, VerificationStatus.UNSUPPORTED_SUMMARY))
+    
+    accuracy = verified / total if total > 0 else 0.0
+    
+    logger.info(f"[METRICS] Final Verification completed. Total citations: {total}. Verified: {verified}. Hallucinatory: {hallucinated}")
+    
     return {
         "metrics": {
             "citation_accuracy": round(accuracy, 4),
-            "citation_thoroughness": round(thoroughness, 4),
-            "total_claims": total,
+            "total_citations": total,
             "verified_claims": verified,
-            "total_evaluations": len(matrix),
-            "entailments": ent, "neutrals": neu, "contradictions": con,
+            "hallucinated": hallucinated
         },
-        "status": "complete",
+        "status": "complete"
     }
 
 
@@ -634,13 +598,13 @@ def build_deep_search_workflow():
 def build_verify_workflow():
     wf = StateGraph(SciVerifyState)
     wf.add_node("decompose", decompose_claims)
-    wf.add_node("retrieve", retrieve_evidence)
-    wf.add_node("audit", audit_claims)
-    wf.add_node("metrics", calculate_metrics)
+    wf.add_node("search", search_literature)
+    wf.add_node("verify", verify_quotes)
+    wf.add_node("metrics", compile_report)
     wf.set_entry_point("decompose")
-    wf.add_edge("decompose", "retrieve")
-    wf.add_edge("retrieve", "audit")
-    wf.add_edge("audit", "metrics")
+    wf.add_edge("decompose", "search")
+    wf.add_edge("search", "verify")
+    wf.add_edge("verify", "metrics")
     wf.add_edge("metrics", END)
     return wf.compile()
 

@@ -16,8 +16,9 @@ from sentence_transformers import SentenceTransformer
 import faiss
 import pyalex
 from pyalex import Works, Authors
+from thefuzz import fuzz
 
-from models import PaperSource
+from models import PaperSource, CitationTarget
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +124,60 @@ def search_openalex(query: str, author_name: str = None, is_oa: bool = False, ma
     return papers
 
 
+def verify_openalex_citation(target: CitationTarget) -> tuple[Optional[PaperSource], str]:
+    """
+    Implements Progressive Relaxation Search to robustly find a hallucinated ChatGPT citation.
+    Cascades through:
+      1. Title + Author + Year
+      2. Title + Author
+      3. Title ONLY
+      4. Author + Year -> fetch all and fuzzy-match title
+    Returns (MatchedPaper, StatusReasoning)
+    """
+    title = target.title or ""
+    year = target.year
+    author_name = target.authors[0] if target.authors else None
+    
+    logger.info(f"[CASCADING SEARCH] Target: Title='{title}', Author='{author_name}', Year={year}")
+
+    def query_with_author(q_title, q_author, q_year, max_res=3):
+        # Fallback to general search openalex
+        return search_openalex(query=q_title, author_name=q_author, max_results=max_res)
+
+    # Level 1: Strict match
+    if title and author_name and year:
+        # OpenAlex doesn't perfectly accept exact year filtering easily without building custom API strings in PyAlex, 
+        # so we search OpenAlex, then filter year in python natively.
+        results = query_with_author(title, author_name, None, max_res=10)
+        for r in results:
+            if r.publication_date and str(year) in r.publication_date:
+                return r, "Matched exactly by Title, Author, and Year."
+
+    # Level 2: Date Forgiveness
+    if title and author_name:
+        results = query_with_author(title, author_name, None, max_res=1)
+        if results:
+            return results[0], "Matched by Title and Author (Date hallucinated)."
+
+    # Level 3: Author Forgiveness
+    if title:
+        results = search_openalex(query=title, author_name=None, max_results=2)
+        for r in results:
+            # Check high fuzzy match in title
+            if fuzz.ratio(title.lower(), r.title.lower()) > 85:
+                return r, "Matched strictly by Title (Author hallucinated)."
+
+    # Level 4: Title Forgiveness (The Abbreviation Rescue)
+    if author_name and year and target.core_topic:
+        logger.info(f"[CASCADING SEARCH] Falling back to Author={author_name} + Topic='{target.core_topic}'")
+        results = query_with_author(target.core_topic, author_name, None, max_res=10)
+        for r in results:
+            if r.publication_date and str(year) in r.publication_date:
+                return r, f"Matched via Author + Topic + Year (Title '{title}' hallucinated into alias)."
+
+    return None, "0 hits found in cascading OpenAlex registry search."
+
+
 # ---------- Full-Text Extraction (Level 2) ----------
 
 def try_extract_full_text(paper: PaperSource) -> Optional[str]:
@@ -168,14 +223,14 @@ def get_paper_text(paper: PaperSource, attempt_full_text: bool = False) -> str:
 
 # ---------- FAISS Indexing ----------
 
-def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> list[str]:
-    """Split text into overlapping word-level chunks."""
-    words = text.split()
-    if len(words) <= chunk_size:
+def chunk_text(text: str, chunk_size: int = 500, overlap: int = 150) -> list[str]:
+    """Split text into overlapping character-level chunks safely."""
+    if len(text) <= chunk_size:
         return [text] if text.strip() else []
     chunks = []
-    for i in range(0, len(words), chunk_size - overlap):
-        chunk = " ".join(words[i : i + chunk_size])
+    step = chunk_size - overlap
+    for i in range(0, len(text), step):
+        chunk = text[i : i + chunk_size]
         if chunk.strip():
             chunks.append(chunk)
     return chunks

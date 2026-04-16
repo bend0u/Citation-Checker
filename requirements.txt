@@ -12,3 +12,5 @@ pandas
 python-dotenv
 pydantic
 sentence-transformers
+thefuzz
+python-Levenshtein

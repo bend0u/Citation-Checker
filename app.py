@@ -126,12 +126,11 @@ def render_header():
 
 
 def render_metrics(metrics: dict):
-    cols = st.columns(4)
+    cols = st.columns(3)
     items = [
-        ("Citation Accuracy", metrics.get("citation_accuracy", 0)),
-        ("Thoroughness", metrics.get("citation_thoroughness", 0)),
-        ("Total Claims", metrics.get("total_claims", 0)),
+        ("Verification Acc.", metrics.get("citation_accuracy", 0)),
         ("Verified Claims", metrics.get("verified_claims", 0)),
+        ("Hallucinated / Error", metrics.get("hallucinated", 0)),
     ]
     for col, (label, val) in zip(cols, items):
         if isinstance(val, float):
@@ -147,90 +146,52 @@ def render_metrics(metrics: dict):
         </div>""", unsafe_allow_html=True)
 
 
-def render_annotated_claims(claims, support_matrix, sources_dict):
-    st.markdown("### 📝 Annotated Claims")
-    # Best result per claim
-    best: dict = {}
-    for entry in support_matrix:
-        cid = entry["claim_id"]
-        conf = entry["result"]["confidence"]
-        if cid not in best or conf > best[cid]["confidence"]:
-            best[cid] = {**entry["result"], "source_id": entry["source_id"]}
-
-    for claim in claims:
-        cid = claim["claim_id"]
-        r = best.get(cid)
-        if not r:
-            css, tag = "claim-neutral", "⚪ Not Evaluated"
-        elif r["label"] == "Entailment":
-            css, tag = "claim-entailment", f"✅ Entailment ({r['confidence']:.0%})"
-        elif r["label"] == "Neutral":
-            css, tag = "claim-neutral", f"⚠️ Neutral ({r['confidence']:.0%})"
-        else:
-            css, tag = "claim-contradiction", f"❌ Contradiction ({r['confidence']:.0%})"
-
-        st.markdown(
-            f'<div class="{css}"><strong>{tag}</strong><br/>{claim["text"]}</div>',
-            unsafe_allow_html=True,
-        )
-        if r and r.get("source_quote"):
-            src = sources_dict.get(r["source_id"], {})
-            with st.expander(f"📄 Source: {src.get('title','Unknown')[:60]}"):
-                st.markdown(f"""
-                <div class="source-quote">
-                <strong>Direct Quote:</strong> "{r['source_quote']}"<br/><br/>
-                <strong>Reasoning:</strong> {r['reasoning']}<br/>
-                <strong>DOI:</strong> <a href="{src.get('doi','')}" target="_blank"
-                    style="color:#7b2ff7;">{src.get('doi','')}</a>
-                </div>""", unsafe_allow_html=True)
-
-
-def render_heatmap(claims, sources, support_matrix):
-    st.markdown("### 🗺️ Factual Support Matrix")
-    if not claims or not sources or not support_matrix:
-        st.info("No data available for the heatmap.")
+def render_verification_report(citations_data: list, verification_results: list):
+    st.markdown("### 📝 Forensic Audit Report")
+    
+    if not citations_data or not verification_results:
+        st.info("No citations were extracted from the provided text.")
         return
 
-    sids = sorted({s.get("source_id", i) for i, s in enumerate(sources)})
-    lookup = {(e["claim_id"], e["source_id"]): e["result"] for e in support_matrix}
-
-    hdr = "<th>Claim</th>"
-    for sid in sids:
-        src = next((s for s in sources if s.get("source_id") == sid), {})
-        hdr += f'<th title="{src.get("title","")}">P{sid}</th>'
-
-    rows = ""
-    for c in claims:
-        cid = c["claim_id"]
-        row = (
-            f'<td style="text-align:left;color:#e0e0e0;font-size:0.8rem;" '
-            f'title="{c["text"]}">S{cid}</td>'
+    citations = {c["claim_id"]: c for c in citations_data}
+    
+    for res in verification_results:
+        cid = res["claim_id"]
+        cit = citations.get(cid, {})
+        status = res["status"]
+        
+        if "Verified Exact Quote" in status or "Supported Semantic Claim" in status:
+            css, color = "claim-entailment", "#00ff88"
+        elif "Unknown" in status:
+            css, color = "claim-neutral", "#ffc107"
+        else:
+            css, color = "claim-contradiction", "#ff1744"
+            
+        st.markdown(
+            f'<div class="{css}"><strong><span style="color:{color}">{status}</span></strong><br/>{cit.get("text", "")}</div>',
+            unsafe_allow_html=True,
         )
-        for sid in sids:
-            r = lookup.get((cid, sid))
-            if r:
-                lab = r["label"]
-                cls = (
-                    "cell-entailment" if lab == "Entailment"
-                    else "cell-neutral" if lab == "Neutral"
-                    else "cell-contradiction"
-                )
-                row += f'<td class="{cls}">{r["confidence"]:.0%}</td>'
-            else:
-                row += "<td>—</td>"
-        rows += f"<tr>{row}</tr>"
-
-    st.markdown(f"""
-    <div class="glass-card">
-        <table class="heatmap-table">
-            <thead><tr>{hdr}</tr></thead><tbody>{rows}</tbody>
-        </table>
-        <div style="margin-top:.8rem;display:flex;gap:1.5rem;justify-content:center;">
-            <span><span style="color:#00ff88;">●</span> Entailment</span>
-            <span><span style="color:#ffc107;">●</span> Neutral</span>
-            <span><span style="color:#ff1744;">●</span> Contradiction</span>
-        </div>
-    </div>""", unsafe_allow_html=True)
+        
+        with st.expander(f"📄 Audit Details: Claim {cid}"):
+            mode = "Exact Quote Search" if cit.get("is_explicit_quote") else "Semantic Summary Search"
+            
+            st.markdown(f"**Verification Engine**: `{mode}`")
+            st.markdown(f"**Target Citation**: `{cit.get('target_metadata', {}).get('title', 'Unknown Title')} by {cit.get('target_metadata', {}).get('authors', ['Unknown'])[0]}`")
+            st.markdown(f"**Auditor Reasoning**: {res.get('reasoning', '')}")
+            if cit.get("is_explicit_quote"):
+                st.markdown(f"**Maximum Fuzzy Match**: `{res.get('similarity_score', 0):.1f}%`")
+                
+            paper = res.get("matched_paper")
+            if paper:
+                doi = paper.get("doi", "")
+                st.markdown(f"""
+                <hr>
+                <div class="source-quote" style="background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 8px;">
+                <strong>Retrieved Source:</strong> {paper.get("title", "")}<br/>
+                <strong>Authors:</strong> {', '.join(paper.get('authors', []))}<br/>
+                <strong>Open Access PDF:</strong> {"✅ Yes" if paper.get("oa_pdf_url") else "❌ No (Paywalled)"}<br/>
+                <strong>DOI:</strong> <a href="{doi}" target="_blank" style="color:#7b2ff7;">{doi}</a>
+                </div>""", unsafe_allow_html=True)
 
 
 def render_sources(sources):
@@ -337,47 +298,15 @@ def parse_chatgpt_export(content: str) -> str:
 def render_results(result: dict):
     """Render the full pipeline output."""
     metrics = result.get("metrics", {})
-    claims = result.get("claims", [])
-    sources = result.get("papers", [])
-    matrix = result.get("support_matrix", [])
-    draft = result.get("draft", "")
+    citations = result.get("citations", [])
+    verification_results = result.get("verification_results", [])
 
     st.markdown("---")
     render_metrics(metrics)
     st.markdown("")
 
-    strategy = result.get("search_strategy", {})
-    if strategy and (strategy.get("authors") or strategy.get("keywords")):
-        with st.expander("🔍 Intelligient Search Strategy", expanded=False):
-            st.markdown("**(LLM Query Reformulator)** Decoded the query to maximize OpenAlex hits.")
-            if strategy.get("authors"):
-                st.markdown(f"**Detected Authors:** `{'`, `'.join(strategy['authors'])}`")
-            if strategy.get("keywords"):
-                kw = " ➔ ".join(strategy["keywords"])
-                st.markdown(f"**Keywords (Specific to General):** `{kw}`")
-            
-            if strategy.get("loops"):
-                st.markdown("**Search Paths Executed ⚡:**")
-                for loop in strategy["loops"]:
-                    st.code(loop, language="text")
-            
-            if strategy.get("fallback_triggered"):
-                st.warning("Phase 1 yielded insufficient relevant papers. Triggered Phase 2: Keyword-only Fallback.")
-
-    st.markdown("")
-
-    col_left, col_right = st.columns([3, 2])
-    sources_dict = {s.get("source_id", i): s for i, s in enumerate(sources)}
-
-    with col_left:
-        if draft:
-            st.markdown("### 📄 Generated Draft")
-            st.markdown(f'<div class="glass-card">{draft}</div>', unsafe_allow_html=True)
-        render_annotated_claims(claims, matrix, sources_dict)
-
-    with col_right:
-        render_heatmap(claims, sources, matrix)
-        render_sources(sources)
+    st.markdown("### 🔬 Verification Details")
+    render_verification_report(citations, verification_results)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
